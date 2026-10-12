@@ -29,7 +29,11 @@ import {
 import { isRetiredExternalChatQuestionSource } from "../../../services/question-response-delivery.js";
 import { HttpError } from "../../../errors.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
-import { issueTreeControlService, isVerifiedIssueTreeControlInteractionWake } from "../../../services/issue-tree-control.js";
+import {
+  ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
+  issueTreeControlService,
+  isVerifiedIssueTreeControlInteractionWake,
+} from "../../../services/issue-tree-control.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "../../../services/recovery/pause-hold-guard.js";
 import { classifyContinuationFailure } from "../../../services/recovery/service.js";
 import { issueService } from "../../../services/issues.js";
@@ -41,7 +45,13 @@ import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
-import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds } from "../../run-dispatch/index.js";
+import {
+  allowsIssueInteractionWake,
+  CHAT_CONVERSATION_ID_KEY,
+  extractWakeCommentIds,
+  isNonAssigneeWorkspaceBusyRetry,
+  queuedRunStillOwnsIssue,
+} from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
@@ -1181,7 +1191,17 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // queued successor still owns the next turn, including during a late
         // finalization/stranded-queue retry under this issue lock. Another
         // agent's review participation retains its separate recovery path.
-        const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        // A queued successor whose agent has handed the issue over is not one:
+        // the queued-run staleness gate cancels it with issue_assignee_changed
+        // before it starts, so it must not strand the new owner's deferred wake.
+        // A source-scoped recovery wake counts as live here because its
+        // authorization needs a separate read; the dispatch gate decides it.
+        const successors = await tx.select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
           input.resumeStrandedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
@@ -1191,7 +1211,28 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             input.resumeStrandedQueue ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
               SELECT source.created_at, source.id FROM heartbeat_runs source
               WHERE source.company_id = ${input.companyId} AND source.id = ${run.id})` : undefined),
-        )).limit(1);
+        ));
+        const reviewParticipant = parseIssueExecutionState(issueRow.executionState)?.currentParticipant ?? null;
+        const successor = successors.find((candidate) => {
+          // A stranded-queue resume reads every agent's later runs, so the
+          // releasing agent's ownership rule does not apply to them.
+          if (input.resumeStrandedQueue || candidate.status !== "queued") return true;
+          const context = candidate.contextSnapshot ?? {};
+          const retryReason = typeof context.retryReason === "string" && context.retryReason.length > 0
+            ? context.retryReason
+            : candidate.scheduledRetryReason ?? null;
+          return queuedRunStillOwnsIssue({
+            runAgentId: run.agentId,
+            issueAssigneeAgentId: issueRow.assigneeAgentId ?? null,
+            isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
+            isInteractionWake: allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS),
+            isCurrentReviewParticipant:
+              issueRow.status === "in_review" &&
+              reviewParticipant?.type === "agent" &&
+              reviewParticipant.agentId === run.agentId,
+            isAuthorizedSourceScopedRecovery: context.wakeReason === "source_scoped_recovery_action",
+          });
+        });
         if (successor) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
 
         if (preDrain.kind === "blocked") {
